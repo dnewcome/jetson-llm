@@ -94,17 +94,26 @@ The Xavier has 32GB unified memory but **NvMap** (NVIDIA's Tegra memory allocato
 
 - Models up to ~8-9GB: load fully on GPU, full speed
 - Models 9-19GB: fail with `NvMapMemAllocInternalTagged: error 12` (ENOMEM) unless using CPU offload
-- Models >19GB: not tested
-
-This is **not** a total memory limit — it's a contiguous physical page allocation constraint imposed by the CMA (Contiguous Memory Allocator) region size in the kernel.
+- Models >19GB: OOM at load time, cannot run on GPU
 
 ### `GGML_CUDA_NO_VMM=1`
 
 The 14B model needs this env var to disable CUDA's Virtual Memory Manager pool, which uses a different (failing) allocation path for scratch buffers. Without it, the 14B crashes mid-computation. Models ≤8B do **not** need this flag (and actually crash with it set).
 
-### Potential fix: increase CMA size
+### NvMap vs. Linux CMA — why you can't fix this with `cma=`
 
-Adding `cma=20G` to kernel boot args in `/boot/extlinux/extlinux.conf` would reserve a larger contiguous region at boot, potentially allowing larger models to run fully on GPU. Requires a reboot.
+NvMap's contiguous heap is **not** Linux CMA. The Tegra bootloader carves out a fixed contiguous region from physical memory at boot, configured in the device tree (DTB), before Linux starts. This is the source of the ~8-9GB ceiling.
+
+Linux's `cma=` kernel parameter controls a completely separate allocator used by display, V4L2 cameras, and similar subsystems — it has no effect on NvMap or GPU compute allocations.
+
+**Experiment:** We tried adding `cma=20G` to `/boot/extlinux/extlinux.conf` hoping to increase GPU-accessible memory. It failed in two ways:
+
+1. The kernel rejected the request outright: `cma: Size (0x500000000) of region exceeds limit (0x100000000)` — Tegra's CMA ceiling is 4GB.
+2. Even though CMA never allocated (`0K cma-reserved`), the failed reservation disrupted the GPU driver's memory layout. All models — including ones that previously worked — crashed with `NvRmGpuLibOpen failed, error=4`.
+
+The fix was to revert `/boot/extlinux/extlinux.conf` from its backup and reboot.
+
+**The real fix** would require modifying the Tegra device tree binary (DTB) to increase the NvMap carveout size (`nvidia,carveout-size`), recompiling the DTB, and flashing it. This is significantly more involved and not guaranteed to work within the Xavier's physical memory constraints. In practice, **~8-9GB is the hard ceiling** for GPU-resident model weights on this board.
 
 ## Downloaded Models
 
