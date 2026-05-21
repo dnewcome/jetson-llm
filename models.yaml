@@ -1,0 +1,153 @@
+# Models to benchmark on Jetson AGX Xavier (32GB unified)
+# Edit freely. Sizes are approximate on-disk; runtime memory is ~1.1-1.3x that
+# once KV cache is allocated.
+#
+# Notes on hardware constraints:
+#   - 32GB unified RAM is shared between CPU and GPU.
+#   - Volta sm_7.2: llama.cpp CUDA works fine. vLLM officially requires sm_8.0+
+#     so we stick to small AWQ/FP16 Qwen2.5 models there, and fall back to
+#     --enforce-eager. Expect vLLM to be slower than llama.cpp on this board.
+#   - Leave ~6GB headroom for system + KV cache. Don't try to load anything
+#     bigger than ~22GB on disk unless you've tuned --n-gpu-layers down.
+
+llamacpp:
+  # Heavy coder. Tight fit: model ~18.5GB, leaves ~9GB for KV @ 4096 ctx.
+  - name: qwen25-coder-32b-q4km
+    repo: bartowski/Qwen2.5-Coder-32B-Instruct-GGUF
+    file: Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf
+    ctx: 4096
+    n_gpu_layers: 99
+    # Set to a smaller integer (e.g. 40) if you OOM.
+
+  # Well-rounded mid-size dense.
+  - name: qwen25-14b-q5km
+    repo: bartowski/Qwen2.5-14B-Instruct-GGUF
+    file: Qwen2.5-14B-Instruct-Q5_K_M.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # Reasoning model, same size class as qwen25-14b. ~10GB on disk, plenty of
+  # headroom for a larger KV cache if you want to stretch ctx.
+  - name: deepseek-r1-distill-qwen-14b-q5km
+    repo: bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF
+    file: DeepSeek-R1-Distill-Qwen-14B-Q5_K_M.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # Speed baseline, comfortable fit.
+  - name: qwen25-coder-7b-q6k
+    repo: bartowski/Qwen2.5-Coder-7B-Instruct-GGUF
+    file: Qwen2.5-Coder-7B-Instruct-Q6_K.gguf
+    ctx: 2048
+    n_gpu_layers: 99
+
+  # Fastest of the bunch on Xavier. Q4_K_M is the sweet spot for tok/s.
+  - name: qwen25-coder-3b-q4km
+    repo: bartowski/Qwen2.5-Coder-3B-Instruct-GGUF
+    file: Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf
+    ctx: 2048
+    n_gpu_layers: 99
+
+  # Gemma 4 MoE: 26B total, ~3.8B active per token. Should generate much
+  # faster than dense 14B at higher quality — best fit for Xavier's
+  # bandwidth-bound profile.
+  - name: gemma4-26b-a4b-q4km
+    repo: bartowski/google_gemma-4-26B-A4B-it-GGUF
+    file: google_gemma-4-26B-A4B-it-Q4_K_M.gguf
+    ctx: 4096
+    # Xavier's NvMap can't serve a >~14GB single CUDA block even fresh-booted
+    # with 30GB free — see docs/nvmap-oom.md. Partial offload is mandatory
+    # for this model; `-fit off` is required so llama-server's autofitter
+    # doesn't override the cap and try to put everything on GPU.
+    n_gpu_layers: 20
+    extra_args: ["-fit", "off"]
+
+  # Smaller quant of the same 26B MoE. ~12.6GB on disk should land under
+  # Xavier's single-block CUDA ceiling (~13GB observed), letting us run
+  # full GPU offload without `-fit off` tricks. MoE quality tolerates Q3
+  # better than dense models since only ~4B params are active per token.
+  - name: gemma4-26b-a4b-q3ks
+    repo: bartowski/google_gemma-4-26B-A4B-it-GGUF
+    file: google_gemma-4-26B-A4B-it-Q3_K_S.gguf
+    ctx: 4096
+    n_gpu_layers: 99
+
+  # Gemma 4 E4B: effective 4B dense with Per-Layer Embeddings. Google
+  # positions it as ~Gemma 3 27B quality. Full Q8_0 fits easily.
+  - name: gemma4-e4b-q8
+    repo: bartowski/google_gemma-4-E4B-it-GGUF
+    file: google_gemma-4-E4B-it-Q8_0.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # NVIDIA's dense 9B reasoning model. Clean GPU fit at Q4_K_M (~6.5GB).
+  - name: nemotron-nano-9b-v2-q4km
+    repo: bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF
+    file: nvidia_NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # ServiceNow's reasoning-tuned 15B (Apriel + Nemotron lineage). Fills the
+  # 15B gap between our 14B Qwen and the 26B Gemma MoE.
+  - name: apriel-nemotron-15b-q4km
+    repo: bartowski/ServiceNow-AI_Apriel-Nemotron-15b-Thinker-GGUF
+    file: ServiceNow-AI_Apriel-Nemotron-15b-Thinker-Q4_K_M.gguf
+    ctx: 4096
+    n_gpu_layers: 99
+    # The GGUF ships a jinja chat template that llama.cpp's automatic
+    # parser can't compile (parse error on `"arguments": {`). Force chatml.
+    extra_args: ["--no-jinja", "--chat-template", "chatml"]
+
+  # NVIDIA Nemotron-3 Nano 30B MoE w/ ~3B active. Direct apples-to-apples vs
+  # gemma4-26b-a4b. Even IQ3_XXS is ~18GB (router/embeddings don't compress),
+  # so partial offload is mandatory — same NvMap ceiling story as gemma4-26b.
+  # See docs/nvmap-oom.md.
+  - name: nemotron3-nano-30b-a3b-iq3xxs
+    repo: bartowski/nvidia_Nemotron-3-Nano-30B-A3B-GGUF
+    file: nvidia_Nemotron-3-Nano-30B-A3B-IQ3_XXS.gguf
+    ctx: 4096
+    n_gpu_layers: 20
+    extra_args: ["-fit", "off"]
+
+  # Qwen3.5 dense 4B. Q8_0 fits trivially — speed baseline at the small end,
+  # apples-to-apples vs gemma4-e4b-q8.
+  - name: qwen35-4b-q8
+    repo: bartowski/Qwen_Qwen3.5-4B-GGUF
+    file: Qwen_Qwen3.5-4B-Q8_0.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # Qwen3.5 dense 9B. Q6_K (~7.4GB) lands in the same slot as nemotron-nano-9b
+  # but at higher fidelity.
+  - name: qwen35-9b-q6k
+    repo: bartowski/Qwen_Qwen3.5-9B-GGUF
+    file: Qwen_Qwen3.5-9B-Q6_K.gguf
+    ctx: 8192
+    n_gpu_layers: 99
+
+  # Qwen3.5 35B MoE w/ ~3B active. IQ3_XXS at ~14.7GB — same NvMap-ceiling
+  # story as qwen36-35b-a3b, partial offload required.
+  - name: qwen35-35b-a3b-iq3xxs
+    repo: bartowski/Qwen_Qwen3.5-35B-A3B-GGUF
+    file: Qwen_Qwen3.5-35B-A3B-IQ3_XXS.gguf
+    ctx: 4096
+    n_gpu_layers: 20
+    extra_args: ["-fit", "off"]
+
+  # Qwen3.6 dense 27B. Q4_K_M is ~18GB — slightly smaller than the 32B coder
+  # and fits with full GPU offload at ctx=4096.
+  - name: qwen36-27b-q4km
+    repo: bartowski/Qwen_Qwen3.6-27B-GGUF
+    file: Qwen_Qwen3.6-27B-Q4_K_M.gguf
+    ctx: 4096
+    n_gpu_layers: 99
+
+  # Qwen3.6 35B MoE w/ ~3B active. IQ3_XXS at ~15.8GB still exceeds Xavier's
+  # single-block CUDA ceiling, so partial offload is mandatory — same pattern
+  # as nemotron3-nano-30b-a3b. See docs/nvmap-oom.md.
+  - name: qwen36-35b-a3b-iq3xxs
+    repo: bartowski/Qwen_Qwen3.6-35B-A3B-GGUF
+    file: Qwen_Qwen3.6-35B-A3B-IQ3_XXS.gguf
+    ctx: 4096
+    n_gpu_layers: 20
+    extra_args: ["-fit", "off"]

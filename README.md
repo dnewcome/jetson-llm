@@ -45,87 +45,138 @@ Builds with CUDA enabled for Volta (`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=7
 ├── 01_setup.sh         # build llama.cpp
 ├── 02_download_models.sh  # download full model suite
 ├── 03_benchmark.sh     # run llama-bench on all models
-└── 04_quick_test.sh    # interactive llama-cli test
+├── 04_quick_test.sh    # interactive llama-cli test
+├── 05_download_yaml.py # download models listed in models.yaml
+├── 06_benchmark_yaml.py # benchmark models on-device
+└── flush_mem.sh        # drop page cache + compact memory before benchmarking
 ```
 
 ## Benchmark Results
 
 All benchmarks: `llama-bench --n-prompt 512 --n-gen 128 --repetitions 3 --n-gpu-layers 99 --threads 8`
 
-| Model | Size | Prompt pp512 (tok/s) | Generation tg128 (tok/s) |
-|-------|------|---------------------:|-------------------------:|
-| Llama 3.2 3B Q4_K_M | 1.9 GB | 646 | **27.3** |
-| Qwen3 8B Q4_K_M | 4.7 GB | 277 | **13.7** |
-| Qwen2.5 14B Q4_K_M | 8.4 GB | 139 | **7.6** |
-| Qwen2.5 32B Q4_K_M | 19 GB | ❌ OOM | — |
+**Important:** run `flush_mem.sh` before each model to drop the Linux page cache and compact physical memory. Without it, large file downloads fragment RAM and cause spurious NvMap ENOMEM errors even on models that easily fit (see [Memory Constraints](#memory-constraints)).
 
-Generation speed roughly halves with each model size doubling. The **8B range** is the practical sweet spot: good quality at ~14 tok/s.
+### Full GPU (all layers on GPU)
+
+| Model | Size | Quant | pp512 (tok/s) | tg128 (tok/s) | Notes |
+|-------|-----:|-------|-------------:|-------------:|-------|
+| Qwen2.5-Coder 3B Instruct | 1.8 GB | Q4_K_M | 643 | **27.6** | |
+| Llama 3.2 3B Instruct | 1.9 GB | Q4_K_M | 646 | **27.3** | |
+| Qwen3.5 4B | 4.3 GB | Q8_0 | 453 | **14.1** | |
+| Qwen3 8B | 4.7 GB | Q4_K_M | 277 | **13.7** | |
+| Gemma4 E4B | 7.5 GB | Q8_0 | 474 | **13.5** | NO_VMM=1 |
+| Qwen2.5-Coder 7B Instruct | 5.8 GB | Q6_K | 323 | **10.5** | |
+| Nemotron-Nano 9B v2 | 6.1 GB | Q4_K_M | 195 | **11.9** | |
+| Qwen3.5 9B | 7.4 GB | Q6_K | 285 | **9.6** | NO_VMM=1 |
+| Qwen2.5 14B Instruct | 8.4 GB | Q4_K_M | 139 | **7.6** | NO_VMM=1 |
+| Apriel-Nemotron 15B Thinker | 8.5 GB | Q4_K_M | 135 | **7.7** | NO_VMM=1 |
+| Qwen2.5 14B Instruct | 9.8 GB | Q5_K_M | 152 | **6.8** | NO_VMM=1 |
+| DeepSeek-R1-Distill Qwen 14B | 9.8 GB | Q5_K_M | 153 | **6.8** | NO_VMM=1 |
+
+### Partial GPU (large models — 20 layers on GPU, rest on CPU)
+
+| Model | Size | Quant | pp512 (tok/s) | tg128 (tok/s) | Active params |
+|-------|-----:|-------|-------------:|-------------:|--------------|
+| Gemma4 26B MoE | 15.9 GB | Q4_K_M | 168 | **9.6** | ~4B |
+| Qwen3.5 35B MoE | 14.7 GB | IQ3_XXS | 149 | **6.6** | ~3B |
+| Qwen3.6 35B MoE | 14.7 GB | IQ3_XXS | 147 | **6.6** | ~3B |
+| Nemotron3-Nano 30B MoE | 16.9 GB | IQ3_XXS | 119 | **7.5** | ~3.5B |
+
+### Failed / Not runnable
+
+| Model | Size | Reason |
+|-------|-----:|--------|
+| Qwen2.5-Coder 32B | 18.5 GB | OOM — exceeds NvMap ceiling |
+| Qwen2.5 32B | 19 GB | OOM — exceeds NvMap ceiling |
+| Qwen3.6 27B Q4_K_M | 16.7 GB | OOM with full GPU; untested at ngl=20 |
+| Gemma4 26B Q3_K_S | 11.4 GB | Failed to load — likely unsupported quant |
+
+### Observations
+
+- The **MoE models punch above their weight**: the 26B and 35B MoE models generate at the same speed as dense 14B models (~7-10 tok/s) because only ~3-4B parameters are active per token, while benefiting from much larger total model capacity.
+- **Gemma4 E4B is the speed/quality sweet spot**: 7.5 GB Q8_0 at 13.5 tok/s — full precision, Google claims ~Gemma 3 27B quality in a 4B effective model.
+- The **~10 GB threshold** (with `GGML_CUDA_NO_VMM=1` and flushed memory) is the real ceiling for full-GPU models, not the ~8-9 GB we initially measured.
 
 ## Running Models
+
+### Flush memory before loading
+
+Large model downloads fill the Linux page cache, which fragments the physically contiguous memory NvMap needs. Always flush before benchmarking or loading a model:
+
+```bash
+bash /data/george/flush_mem.sh
+```
+
+This runs `drop_caches` and `compact_memory`, reclaiming page cache and defragmenting RAM. Takes ~2 seconds.
 
 ### Benchmark a model
 
 ```bash
-# Standard (works for models up to ~8GB)
+# Small models (≤7 GB) — no special flags needed
+bash /data/george/flush_mem.sh
 /data/george/llama.cpp/build/bin/llama-bench \
   --model /data/george/models/qwen3-8b-q4km.gguf \
   --n-gpu-layers 99 --threads 8 \
   --n-prompt 512 --n-gen 128 --repetitions 3
 
-# For 14B and larger — requires GGML_CUDA_NO_VMM=1
+# Medium models (7–10 GB) — disable CUDA VMM pool
+bash /data/george/flush_mem.sh
 env GGML_CUDA_NO_VMM=1 /data/george/llama.cpp/build/bin/llama-bench \
   --model /data/george/models/qwen2.5-14b-q4km.gguf \
   --n-gpu-layers 99 --threads 8 \
+  --n-prompt 512 --n-gen 128 --repetitions 3
+
+# Large models (>10 GB) — partial GPU offload required
+bash /data/george/flush_mem.sh
+/data/george/llama.cpp/build/bin/llama-bench \
+  --model /data/george/models/google_gemma-4-26B-A4B-it-Q4_K_M.gguf \
+  --n-gpu-layers 20 --threads 8 \
   --n-prompt 512 --n-gen 128 --repetitions 3
 ```
 
 ### Interactive chat
 
 ```bash
+bash /data/george/flush_mem.sh
 env GGML_CUDA_NO_VMM=1 /data/george/llama.cpp/build/bin/llama-cli \
-  --model /data/george/models/qwen3-8b-q4km.gguf \
+  --model /data/george/models/qwen2.5-14b-q4km.gguf \
   --n-gpu-layers 99 --threads 8 --ctx-size 4096 \
   --conversation --log-disable
 ```
 
 ## Memory Constraints
 
-The Xavier has 32GB unified memory but **NvMap** (NVIDIA's Tegra memory allocator) limits individual GPU-accessible contiguous allocations to roughly **8-9GB**. This means:
+The Xavier has 32GB unified memory shared between CPU and GPU. The key constraint is **NvMap** (NVIDIA's Tegra memory allocator), which requires physically contiguous pages for GPU allocations.
 
-- Models up to ~8-9GB: load fully on GPU, full speed
-- Models 9-19GB: fail with `NvMapMemAllocInternalTagged: error 12` (ENOMEM) unless using CPU offload
-- Models >19GB: OOM at load time, cannot run on GPU
+### The page cache problem
+
+After downloading large model files (tens of GB), the Linux kernel caches those file contents in RAM. This fragmented physical memory makes it impossible for NvMap to find the large contiguous block it needs — even if `free` shows gigabytes available. The symptom is `NvMapMemAllocInternalTagged: error 12` (ENOMEM) on models that should easily fit.
+
+**Fix:** `flush_mem.sh` writes to `/proc/sys/vm/drop_caches` (frees page cache) and `/proc/sys/vm/compact_memory` (defragments physical pages). Before flushing, a fresh system shows ~700 MB free with 28 GB in cache. After flushing: ~29 GB free and contiguous.
 
 ### `GGML_CUDA_NO_VMM=1`
 
-The 14B model needs this env var to disable CUDA's Virtual Memory Manager pool, which uses a different (failing) allocation path for scratch buffers. Without it, the 14B crashes mid-computation. Models ≤8B do **not** need this flag (and actually crash with it set).
+Models in the 7–10 GB range need this env var to disable CUDA's Virtual Memory Manager pool. The VMM pool uses a different allocation path for scratch buffers that fails on Xavier for medium-large models. Models ≤7 GB work fine without it; do **not** set it for those (it causes crashes).
+
+### NvMap ceiling
+
+The true NvMap ceiling for a single contiguous GPU allocation on this board (after flushing) is approximately **~10 GB**. Models up to 9.8 GB load fine with `GGML_CUDA_NO_VMM=1`. Models over ~10 GB require partial offload (`--n-gpu-layers 20`) to split weight storage across CPU and GPU memory.
 
 ### NvMap vs. Linux CMA — why you can't fix this with `cma=`
 
-NvMap's contiguous heap is **not** Linux CMA. The Tegra bootloader carves out a fixed contiguous region from physical memory at boot, configured in the device tree (DTB), before Linux starts. This is the source of the ~8-9GB ceiling.
+NvMap's contiguous heap is **not** Linux CMA. The Tegra bootloader carves out a fixed contiguous region from physical memory at boot, configured in the device tree (DTB), before Linux starts. Linux's `cma=` kernel parameter controls a completely separate allocator used by display and camera subsystems — it has no effect on NvMap or GPU compute allocations.
 
-Linux's `cma=` kernel parameter controls a completely separate allocator used by display, V4L2 cameras, and similar subsystems — it has no effect on NvMap or GPU compute allocations.
+**Experiment:** We tried adding `cma=20G` to `/boot/extlinux/extlinux.conf`. It failed in two ways:
 
-**Experiment:** We tried adding `cma=20G` to `/boot/extlinux/extlinux.conf` hoping to increase GPU-accessible memory. It failed in two ways:
+1. The kernel rejected the request: `cma: Size (0x500000000) of region exceeds limit (0x100000000)` — Tegra's CMA ceiling is 4 GB.
+2. Even though CMA never allocated, the failed reservation disrupted the GPU driver. All models crashed with `NvRmGpuLibOpen failed, error=4`. Fix: revert from backup and reboot.
 
-1. The kernel rejected the request outright: `cma: Size (0x500000000) of region exceeds limit (0x100000000)` — Tegra's CMA ceiling is 4GB.
-2. Even though CMA never allocated (`0K cma-reserved`), the failed reservation disrupted the GPU driver's memory layout. All models — including ones that previously worked — crashed with `NvRmGpuLibOpen failed, error=4`.
-
-The fix was to revert `/boot/extlinux/extlinux.conf` from its backup and reboot.
-
-**The real fix** would require modifying the Tegra device tree binary (DTB) to increase the NvMap carveout size (`nvidia,carveout-size`), recompiling the DTB, and flashing it. This is significantly more involved and not guaranteed to work within the Xavier's physical memory constraints. In practice, **~8-9GB is the hard ceiling** for GPU-resident model weights on this board.
-
-## Downloaded Models
-
-| File | Size |
-|------|------|
-| `llama-3.2-3b-q4km.gguf` | 1.9 GB |
-| `qwen3-8b-q4km.gguf` | 4.7 GB |
-| `qwen2.5-14b-q4km.gguf` | 8.4 GB |
-| `qwen2.5-32b-q4km.gguf` | 19 GB |
+The real fix for a larger NvMap ceiling would require modifying the Tegra device tree binary (DTB) — significantly more involved and not guaranteed to work.
 
 ## Notes
 
-- HuggingFace throttles large unauthenticated downloads. Use `huggingface-cli login` with a token for faster speeds on models >5GB.
-- The NVMe is not auto-mounted at boot unless `/etc/fstab` has been updated (done during setup).
+- HuggingFace throttles large unauthenticated downloads. Use `huggingface-cli login` with a token for faster speeds on models >5 GB.
+- The NVMe is auto-mounted at boot via `/etc/fstab` (set up during initial setup).
 - llama.cpp build hash: `871b0b7`
+- Benchmarks run with `scripts/07_benchmark_mac.py`, which flushes memory before each model via SSH from a Mac.
