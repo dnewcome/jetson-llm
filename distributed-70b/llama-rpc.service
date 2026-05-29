@@ -1,0 +1,14 @@
+[Unit]
+Description=llama.cpp RPC worker (board 2 GPU)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/data/zen/llm/rpc-server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=llama.cpp distributed 70B server (board 1 coordinator)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/mnt/nvme/zen/llm/serve-distributed.sh
+# Board 1 needs board 2's rpc-server reachable first; retry until it is.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
