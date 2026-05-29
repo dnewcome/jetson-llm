@@ -1,0 +1,5 @@
+
+# Jetson flashing artifacts (large; never commit)
+flashing/*.tbz2
+flashing/Linux_for_Tegra/
+flashing/work/
