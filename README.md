@@ -2,6 +2,24 @@
 
 Local LLM inference benchmarks using [llama.cpp](https://github.com/ggerganov/llama.cpp) on a NVIDIA Jetson AGX Xavier 32GB.
 
+> ## Update: the "~10GB ceiling" was `mmap`, not NvMap — use `--no-mmap`
+>
+> The single-allocation ceiling documented in [Memory Constraints](#memory-constraints) is **not** a hardware / NvMap / CMA limit. It's **`mmap` double-counting**: with mmap on (llama.cpp's default), a model is resident in RAM *twice* during load — the page-cached file **plus** the GPU buffer it's copied into (~2× its size). On a 30GB unified board that caps you near half (~10GB), and `NvMapMemAllocInternalTagged: error 12` is plain **ENOMEM**, not a contiguity failure. So the CMA/DTB hunt was the wrong tree — the GPU's SMMU/IOMMU already maps scattered pages into a contiguous GPU address space, so no large physically-contiguous block is ever needed (a raw `cudaMalloc` probe reaches 28GB after a flush).
+>
+> **Fix: add `--no-mmap` (or `--mmap 0` to `llama-bench`)** — it reads weights straight into the GPU buffer with no cached duplicate. Models up to ~24GB then load **full-GPU on one board**. Proof — same board, `-ngl 99`, flushed: `Qwen2.5-Coder-32B-Q4_K_M` (18.5GB) **OOMs with `--mmap 1`, loads fine with `--mmap 0`**, on *both* the old (`871b0b7`) and new builds (so it's not the build or VMM).
+>
+> Re-benchmarked with `--no-mmap -ngl 99` (previously OOM / partial-only):
+>
+> | Model | Size | Was | Now | pp64 | tg16 |
+> |---|--:|---|---|--:|--:|
+> | Qwen2.5-Coder 32B | 18.5 GB | OOM | ✅ full GPU | 12.8 | 2.58 |
+> | Qwen2.5 32B | 18.5 GB | OOM | ✅ full GPU | 12.8 | 2.58 |
+> | Qwen3.6 27B | 16.7 GB | OOM | ✅ full GPU | 16.9 | 2.90 |
+> | Nemotron-3-Nano 30B MoE | 16.9 GB | partial (ngl 20, 7.5) | ✅ full GPU | 74.0 | **16.9** |
+> | Gemma4 26B Q3_K_S | 11.4 GB | failed | ✗ still fails — unsupported quant, *not* memory | | |
+>
+> The Nemotron MoE more than doubles (7.5 → 16.9 tg) going full-GPU. The original investigation below is kept as the debugging record. For a 70B that *still* won't fit one board, see [`distributed-70b/`](distributed-70b/) — split across two Xaviers via RPC.
+
 ## Hardware
 
 | | |
@@ -85,6 +103,8 @@ All benchmarks: `llama-bench --n-prompt 512 --n-gen 128 --repetitions 3 --n-gpu-
 
 ### Failed / Not runnable
 
+> **Update:** three of these (Coder-32B, Qwen2.5-32B, Qwen3.6-27B) now run **full-GPU with `--no-mmap`** — see the Update section at top. Only Gemma4 26B Q3_K_S still fails, and that's an unsupported-quant load error, not memory.
+
 | Model | Size | Reason |
 |-------|-----:|--------|
 | Qwen2.5-Coder 32B | 18.5 GB | OOM — exceeds NvMap ceiling |
@@ -146,6 +166,8 @@ env GGML_CUDA_NO_VMM=1 /data/george/llama.cpp/build/bin/llama-cli \
 ```
 
 ## Memory Constraints
+
+> **Resolved — see the Update section at the top of this README.** The "physical contiguity / NvMap ceiling" framing below turned out to be wrong: the real cause was `mmap` double-counting RAM, fixed with `--no-mmap`. This section is kept as the debugging record.
 
 The Xavier has 32GB unified memory shared between CPU and GPU. The key constraint is **NvMap** (NVIDIA's Tegra memory allocator), which requires physically contiguous pages for GPU allocations.
 
