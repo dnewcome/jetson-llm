@@ -2,6 +2,15 @@
 
 A 42.5GB model (Llama 3.3 70B, Q4_K_M) doesn't fit on one 30GB board, so we split it across two with llama.cpp's **RPC backend**: board 1 holds ~half the layers on its GPU and streams activations to board 2, which holds the other half (pipeline parallelism).
 
+## Model
+
+[`Llama-3.3-70B-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/Llama-3.3-70B-Instruct-GGUF) — Meta Llama 3.3 70B Instruct, Q4_K_M, **42.5 GB** (ungated GGUF; no HF token needed). Download to board 1:
+
+```bash
+wget -c "https://huggingface.co/bartowski/Llama-3.3-70B-Instruct-GGUF/resolve/main/Llama-3.3-70B-Instruct-Q4_K_M.gguf" \
+  -O /mnt/nvme/zen/llm/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
+```
+
 ## Hardware
 
 |  | Board 1 (coordinator) | Board 2 (RPC worker) |
