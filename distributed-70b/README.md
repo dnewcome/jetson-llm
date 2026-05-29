@@ -70,6 +70,26 @@ Board 1's service retries until board 2's `rpc-server` is reachable. Boot both h
 - Both GPUs confirmed computing (GR3D 99% each, alternating — that's the pipeline).
 - Throughput (board 2 capped at 30W): **~7.6 tok/s prompt, ~1.7 tok/s generation.** Slow — a 70B is memory-bandwidth-bound on Volta — but it runs a model neither board could hold alone.
 
+## Scaling — pushing past 70B
+
+We then loaded **Qwen2.5-72B-Instruct-Q4_K_M (47.4GB)** — the largest dense model that fits on two boards.
+
+| Model | Size | Per board | TTFT (prefill) | Generation |
+|---|--:|--:|--:|--:|
+| Llama 3.3 70B Q4_K_M | 42.5GB | ~21.3GB | ~130 ms/tok | ~1.7 tok/s |
+| Qwen2.5-72B Q4_K_M | 47.4GB | ~23.7GB | ~183 ms/tok (8.2s @ 45-tok prompt) | ~1.59 tok/s |
+
+After the 72B loaded, each board still showed **~6GB `available`** — read the **`available`** column, not `free`. Linux keeps `free` low and holds reclaimable page cache; `available` (= free + reclaimable) is the real headroom. So the ceiling for two boards:
+
+- **Combined weight budget ≈ 57GB** (~28.5GB usable per board) → about **85B at Q4_K_M**. A 90B at Q4_K_M (~59GB) is ~2GB over the line; it needs Q4_0 (~53GB) or Q3.
+- **TTFT scales with prompt length** (~183 ms/token on the 72B): a 512-token prompt is ~90s to first token. Batch/agentic-friendly, rough for interactive.
+- **A third RPC worker lifts the wall** — each board adds ~28GB, so three boards ≈ 85GB budget → a 90B at full Q4_K_M, or ~120B.
+
+To run the 72B, set `MODEL=` to its path and use a tighter config (`-c 2048`, `-b 256 -ub 64`) — it fits with ~6GB/board to spare:
+```bash
+MODEL=/mnt/nvme/zen/llm/models/Qwen2.5-72B-Instruct-Q4_K_M.gguf CTX=2048 ./serve-distributed.sh
+```
+
 ## Notes / gotchas
 
 - **Memory — the "~10GB NvMap ceiling" is `mmap` double-counting, not hardware.** With `mmap` on (llama.cpp's default), a model is resident in RAM *twice* during load — the page-cached file plus the GPU buffer it's copied into (~2× its size). On a 30GB unified board that caps you near half (~10GB), and the `NvMapMemAllocInternalTagged: error 12` is plain ENOMEM, not a contiguity failure. **`--no-mmap` removes the duplicate**, so models up to ~24GB load full-GPU on one board (and the 70B's ~21GB half fits per board here). Proof — same board, `-ngl 99`, flushed: `Qwen2.5-Coder-32B-Q4_K_M` (18.48 GiB) **OOMs with `--mmap 1`, loads fine with `--mmap 0`**, on *both* the old (`871b0b7`) and new (`33c718d`) builds, so it's not the build or VMM. The Xavier GPU's SMMU/IOMMU maps scattered pages into a contiguous GPU address space, so no large physically-contiguous block is ever needed — which is why CMA/DTB tweaks were the wrong fix. (A raw `cudaMalloc` probe, `memprobe.cu`, reaches a 28GB single block after a flush — the allocator was never the limit.) Still flush page cache before loading.
