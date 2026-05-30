@@ -90,6 +90,64 @@ To run the 72B, set `MODEL=` to its path and use a tighter config (`-c 2048`, `-
 MODEL=/mnt/nvme/zen/llm/models/Qwen2.5-72B-Instruct-Q4_K_M.gguf CTX=2048 ./serve-distributed.sh
 ```
 
+## 3-board cluster — 72B at 128k context
+
+Adding a third Xavier (16GB AGX) shifts the bottleneck from "can it fit?" to "how big a context can we hold?". The 16GB board takes a smaller weight share via `-ts 0.4,0.4,0.2`; the headroom freed on the 32GB boards goes to KV cache for 128k.
+
+| Cluster | Model | Context | TTFT (prefill) | Generation |
+|---|---|--:|--:|--:|
+| 2× 32GB | Llama 3.3 70B Q4_K_M | 4k | ~130 ms/tok | ~1.7 tok/s |
+| 2× 32GB | Qwen2.5-72B Q4_K_M | 4k | ~183 ms/tok | ~1.59 tok/s |
+| **2× 32GB + 1× 16GB** | **Qwen2.5-72B Q4_K_M** | **128k (YaRN, q4 KV)** | **~260 ms/tok** (13.5s @ 52-tok prompt) | **~1.54 tok/s** |
+
+Why 128k needs the 3rd board: on 2×32GB the per-board budget is ~28GB. 72B-Q4 splits to ~23.7GB/board → ~4–5GB headroom each. A 128k q4_0 KV cache costs ~4GB/board (with `-ts 0.5,0.5`) plus ~1GB compute = ~29GB/board, **at or over the line**. Adding the 16GB board pulls 20% of layers off the 32GB boards (KV shrinks proportionally) and buys 128k breathing room: ~5.8GB available on board 1 after the full 128k KV alloc. Without it, the 2-board ceiling for 72B is roughly **96–110k at q4 KV**, not 128k.
+
+Speed cost of the third board: ~5–10% slower TTFT and similar generation tok/s (board 3 capped at 30W gates the pipeline). The trade is **context capacity, not throughput**.
+
+### Provisioning the 3rd board
+
+The 16GB AGX Xavier came from another project with no creds → re-flashed via [`flashing/native_flash.sh`](../flashing/), then provisioned headless over `/dev/ttyACM0` USB serial. Post-first-boot steps:
+
+1. `sudo nvpmodel -m 3` — 30W power cap (PSU safety, matches board 2).
+2. `sudo systemctl set-default multi-user.target && sudo systemctl isolate multi-user.target` — drop the desktop, free ~4GB.
+3. `sudo apt install cuda-toolkit-11-4` — **L4T `flash.sh` installs drivers (libcuda via tegra) but not the CUDA toolkit runtime** (libcudart, libcublas). Without this `rpc-server` fails with `libcudart.so.11.0: not found`.
+4. rsync `llama.cpp/build/` from board 2 (same `sm_72`, no rebuild — ~412MB tar-piped in ~45s over gigabit):
+   ```bash
+   ssh dan-jetson-2.local 'cd /data/zen/llm/llama.cpp && tar c build' \
+     | ssh dan-jetson-3.local 'mkdir -p ~/llm/llama.cpp && cd ~/llm/llama.cpp && tar x'
+   ```
+5. Start `rpc-server` on the new board:
+   ```bash
+   cd ~/llm/llama.cpp/build/bin && export PATH=/usr/local/cuda/bin:$PATH
+   nohup ./rpc-server -H 0.0.0.0 -p 50052 >~/llm/rpc-server.log 2>&1 &
+   ```
+
+### Launch
+
+```bash
+./llama-server \
+  -m /mnt/nvme/zen/llm/models/Qwen2.5-72B-Instruct-Q4_K_M.gguf \
+  --rpc dan-jetson-2.local:50052,dan-jetson-3.local:50052 \
+  -dev CUDA0,RPC0,RPC1 -ngl 99 -sm layer -ts 0.4,0.4,0.2 \
+  --parallel 1 -c 131072 \
+  --rope-scaling yarn --yarn-orig-ctx 32768 \
+  -ctk q4_0 -ctv q4_0 \
+  -b 256 -ub 64 -fit off --no-mmap \
+  --host 0.0.0.0 --port 8080
+```
+
+Key flags beyond the 2-board config:
+- **`-ts 0.4,0.4,0.2`** — weight split proportional to board RAM (16GB board gets half what 32GB boards get).
+- **`-c 131072 --rope-scaling yarn --yarn-orig-ctx 32768`** — Qwen2.5-72B is natively 32k; YaRN extends to 128k (factor 4).
+- **`-ctk q4_0 -ctv q4_0`** — 4-bit KV cache, 4× smaller than fp16. *Difference between fits and OOMs.*
+
+### Load + runtime notes
+
+- **Load takes ~5 min** end-to-end: board 1 reads 47.4GB from NVMe (`--no-mmap`), board 2 receives its ~19GB share over gigabit, board 3 receives its ~9.5GB share. **Distribution is sequential, not parallel** — watching LAN, board 2 goes quiet first (it's done), then board 3 lights up. The model stays resident after load; subsequent requests reuse it. Only a server restart (or worker death) triggers re-load.
+- **All three boards must stay alive** during a request — if any worker drops mid-generation, the request stalls. systemd `Restart=on-failure` on each worker's `rpc-server` unit handles boot/network blips.
+- **mDNS hostnames** (`dan-jetson-N.local`) make the cluster survive DHCP changes. After renaming a board, restart `avahi-daemon` (it caches stale hostnames).
+- **TCP-connect probes are unreliable for liveness during load** — `rpc-server` is busy serving the data stream, so a 2s connect can time out even though the server is healthy. Poll `/health` on the coordinator instead.
+
 ## Notes / gotchas
 
 - **Memory — the "~10GB NvMap ceiling" is `mmap` double-counting, not hardware.** With `mmap` on (llama.cpp's default), a model is resident in RAM *twice* during load — the page-cached file plus the GPU buffer it's copied into (~2× its size). On a 30GB unified board that caps you near half (~10GB), and the `NvMapMemAllocInternalTagged: error 12` is plain ENOMEM, not a contiguity failure. **`--no-mmap` removes the duplicate**, so models up to ~24GB load full-GPU on one board (and the 70B's ~21GB half fits per board here). Proof — same board, `-ngl 99`, flushed: `Qwen2.5-Coder-32B-Q4_K_M` (18.48 GiB) **OOMs with `--mmap 1`, loads fine with `--mmap 0`**, on *both* the old (`871b0b7`) and new (`33c718d`) builds, so it's not the build or VMM. The Xavier GPU's SMMU/IOMMU maps scattered pages into a contiguous GPU address space, so no large physically-contiguous block is ever needed — which is why CMA/DTB tweaks were the wrong fix. (A raw `cudaMalloc` probe, `memprobe.cu`, reaches a 28GB single block after a flush — the allocator was never the limit.) Still flush page cache before loading.
