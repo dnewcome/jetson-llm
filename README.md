@@ -18,7 +18,7 @@ Local LLM inference benchmarks using [llama.cpp](https://github.com/ggerganov/ll
 > | Nemotron-3-Nano 30B MoE | 16.9 GB | partial (ngl 20, 7.5) | ✅ full GPU | 74.0 | **16.9** |
 > | Gemma4 26B Q3_K_S | 11.4 GB | failed | ✗ still fails — unsupported quant, *not* memory | | |
 >
-> The Nemotron MoE more than doubles (7.5 → 16.9 tg) going full-GPU. The original investigation below is kept as the debugging record. For a 70B that *still* won't fit one board, see [`distributed-70b/`](distributed-70b/) — split across two Xaviers via RPC.
+> The Nemotron MoE more than doubles (7.5 → 16.9 tg) going full-GPU. The original investigation below is kept as the debugging record. For a 70B that *still* won't fit one board, see [`distributed-70b/`](distributed-70b/) — split across two Xaviers via RPC. To use one of these boards as an Anthropic-compatible API endpoint for **Claude CLI** (or Aider, Cline, etc.), see [`serving/`](serving/) — a single-board Hermes-3-8B + 128k context config tuned for agentic coding clients.
 
 ## Hardware
 
